@@ -29,6 +29,8 @@ class QueryLog(Base, TimestampMixin):
     blocked_reason: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
     blocked_expression: Mapped[str | None] = mapped_column(Text, nullable=True)
     predicates: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    or_groups: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    or_group_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     hit_partitions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     hit_partition_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     total_partition_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

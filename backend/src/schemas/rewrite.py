@@ -7,6 +7,19 @@ class RewriteGenerateRequest(BaseModel):
     limit: int = 12
 
 
+class BranchCheckOut(BaseModel):
+    """一条 OR 支的等价核对记录（identical / proven / unproven）。"""
+
+    group_index: int
+    branch_index: int
+    expression_before: str
+    expression_after: str
+    status: str
+    rules: list[str] = []
+    unproven: list[str] = []
+    note: str = ""
+
+
 class RewriteOut(BaseModel):
     id: int
     suggestion_no: str
@@ -25,6 +38,7 @@ class RewriteOut(BaseModel):
     score: float
     status: str
     rationale: str
+    publishable: bool = True
 
 
 class RewriteDetail(RewriteOut):
@@ -36,6 +50,8 @@ class RewriteDetail(RewriteOut):
     after_prunable: bool
     after_hit_partition_count: int
     after_total_partition_count: int
+    branch_checks: list[BranchCheckOut] = []
+    publish_blockers: list[str] = []
 
 
 class RewriteReevaluateOut(BaseModel):

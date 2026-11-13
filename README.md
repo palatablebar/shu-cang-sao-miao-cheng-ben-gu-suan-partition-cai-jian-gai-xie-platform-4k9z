@@ -14,22 +14,23 @@
   3. 09:05 对这条查询生成改写建议 `RW-QL-0001`：`dt = '2026-11-11'` + 建议投影列，节省 98.8%。
   4. 09:20 重估并把建议标记为采纳，导出 12 行优化清单 CSV 发给数据开发。
   5. 09:40 陈肃按清单改掉 8 条隐式类型转换（`dt = 20261112` → `dt = '2026-11-12'`）。
-  6. 10:10 周娅（财务 BP，只读）打开预算页看子集 1,800 元预算占用（折算约 81%），无法触发估算/改写（后端 403）。
+  6. 10:10 周娅（财务 BP，只读）打开预算页看子集 1,800 元预算占用（折算约 91%，warn 区间），无法触发估算/改写（后端 403）。
   7. 10:30 沈知远把 DWD 层单条扫描告警阈值从 8 GiB 调到 6 GiB，审计流水留痕。
+  8. 10:50 运营那条「日期或状态」兜底查询（`dt = '…' OR order_status = 'PAID'`）上榜：日期支命中 1 个分区、状态支扫全表，整条按并集记全表扫描；点开详情逐支展开，与汇总对账一致。对它生成改写被 409 拦下——状态支无法证明等价，整条建议不予发布。
 
 ## 2. 主要功能
 
 | 模块 | 说明 |
 |---|---|
-| 查询成本排行 | 按扫描字节/费用/耗时排行，标注「可裁剪 / 裁剪失效 + 原因」，支持来源、表、关键字过滤 |
-| SQL 解析详情 | sqlglot 解析结果：分区谓词逐条判定、命中分区、列裁剪比例、扫描量拆解、可解释结论 |
-| 改写建议与前后对比 | 反模式识别 → 等价改写 SQL → 重估节省 → 按 `saving × confidence ÷ risk_weight` 排序，可采纳/导出 |
+| 查询成本排行 | 按扫描字节/费用/耗时排行，标注「可裁剪 / 裁剪失效 + 原因」，OR 多支查询带 `OR×n` 标记，支持来源、表、关键字过滤 |
+| SQL 解析详情 | sqlglot 解析结果：分区谓词逐条判定、**OR 组逐支拆解（命中分区/扫描量/费用/阻断原因 + 并集汇总对账）**、列裁剪比例、扫描量拆解、可解释结论 |
+| 改写建议与前后对比 | 反模式识别 → 等价改写 SQL → 重估节省 → 按 `saving × confidence ÷ risk_weight` 排序；**OR 组逐支等价核对，任一支无法证明等价 → 整条建议不予发布（409）**，可采纳/导出 |
 | 表与分区元数据 | 6 张表 / 90 个日分区 / 列字节统计 / 建议投影列；admin 可维护负责人与说明 |
-| 预算策略与批次 | 子集月预算 1,800 元（全仓 1.8 万的 1/10）与 warn/critical 阈值、按表扫描分布、估算批次（Celery 异步）、审计流水（admin） |
+| 预算策略与批次 | 子集月预算 1,800 元（全仓 1.8 万的 1/10）与 warn/critical 阈值、按表扫描分布、估算批次（Celery 异步，**失败回滚保留旧版本完整分析**）、审计流水（admin） |
 
 ## 3. 算法口径
 
-### 算法 1：扫描量估算与裁剪判定（`backend/src/analysis/sql_analyzer.py`、`predicates.py`、`estimator.py`）
+### 算法 1：扫描量估算与裁剪判定（`backend/src/analysis/sql_analyzer.py`、`predicates.py`、`branches.py`、`estimator.py`）
 
 ```
 col_ratio  = Σ_{c ∈ 引用列且 c 不是分区键} bytes_c / Σ_{c ∈ 数据列} bytes_c
@@ -44,12 +45,28 @@ P_hit      = { p | 分区谓词在 p.dt 上求值为真 }
 - `SELECT *` 时 `col_ratio = 1.0`；纯聚合按最小列比例 0.03 计。
 - 失败态：`unparsed`（sqlglot 解析失败）、`missing_table`（表不在元数据目录）都会显式返回，绝不静默记 0。
 
+**OR 多支口径（`branches.py`）**：运营查询常把多个条件用 OR 拼在一起，只算一支会把「日期支命中 1 个分区」当成整条费用、漏掉状态支的全表扫描。因此顶层 OR 逐支估算：
+
+```
+支命中   = 支内可用分区谓词的交集；支内无可用分区谓词 → 该支命中全部分区
+组命中   = ∪ 各支命中（并集去重）
+整条命中 = (∩ 普通可用谓词) ∩ (∩ 各 OR 组并集)
+支费用   = 支扫描字节 × 单价；各支费用之和 ≥ 组费用（并集去重），单支费用不得当成整条费用
+```
+
+- 支内没有分区列谓词（如 `order_status = 'PAID'`）= `non_partition_filter`，该支扫全表；
+- 任一支不可裁剪 → 整条判定裁剪失效（命中仍按交集如实计算）；
+- `col_ratio` 只舍入一次（6 位），落库的比例与支/组/整条扫描量用同一值，保证「扫描量 = 命中字节 × 列裁剪比例」在页面上能精确对账；
+- 详情页可展开每支的命中分区/扫描量/费用/阻断原因，并集汇总与整条汇总有对账行（支→组、组→整条）。
+
 ### 算法 2：改写建议与收益排序（`backend/src/analysis/rewriter.py`、`scoring.py`）
 
 - 反模式：`partition_function_wrap` / `partition_implicit_cast` / `select_star` / `missing_partition_predicate`；
 - 改写：裸列比较、同类型字面量、按表元数据建议投影列替换 `*`、补最近 7 天时间窗口；
 - 风险与置信度：低风险 1.0/0.95、中风险 1.6/0.90、高风险 2.4/0.62（同一查询命中多类取最严 + 最低置信度）；
 - **改写后扫描量不是估算系数**，而是把改写 SQL 重新喂给算法 1 求解，`saving = before − after`，`score = saving_bytes × confidence ÷ risk_weight`。
+
+**OR 逐支等价核对与发布闸**：OR 组逐支改写，每一支记录核对结果——`identical`（未改动·恒等）/ `proven`（命中已知等价规则：去函数包裹、字面量归一化）/ `unproven`（无法证明等价，如 `coalesce(dt,…)`）。**任一支 `unproven` → `publishable = false` → 生成、重估、采纳全部 409，整条建议不予发布**；含 OR 组的查询绝不补时间窗口（窗口会收窄某一支、丢掉另一支的记录）。失败重试（生成/重估/估算批次）只在单事务整体提交，失败回滚后旧版本的完整分析（含逐支核对结果）原样保留，不留半套分支结果。
 
 ## 4. 快速启动
 
@@ -68,6 +85,12 @@ open http://localhost:18243
 
 ```bash
 docker compose exec -T backend python -m scripts.seed_demo
+```
+
+OR 多支口径的离线验收（纯函数，不依赖数据库；最后一行固定输出 `VERIFY_OR_BRANCHES OK`）：
+
+```bash
+docker compose exec -T backend python -m scripts.verify_or_branches
 ```
 
 ## 5. 演示账号（密码统一 `Demo@2026`）
@@ -97,8 +120,8 @@ docker compose exec -T backend python -m scripts.seed_demo
 ```
 backend/
   src/{config,constants,models,schemas,analysis,services,controllers,routes,middlewares,utils,tasks}
-  scripts/{seed_demo.py,demo_dataset.py}
-  migrations/0001_initial.sql
+  scripts/{seed_demo.py,demo_dataset.py,verify_or_branches.py}
+  migrations/{0001_initial.sql,0002_or_branches.sql}
 worker/{Dockerfile,entrypoint.sh,healthy.py}
 frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants,styles}
 docker-compose.yml  .env.example  README.md
@@ -134,7 +157,7 @@ docker-compose.yml  .env.example  README.md
 | 枚举 | 后端 | 前端 |
 |---|---|---|
 | `Role` (admin/engineer/viewer) | `backend/src/constants/enums.py`、`middlewares/rbac.py`、`models/user.py`、`scripts/demo_dataset.py` | `frontend/src/types/user.ts`、`constants/enums.ts`(ROLE_LABEL)、`stores/authStore.ts` |
-| `PruneBlockReason` | `constants/enums.py`、`analysis/predicates.py`、`analysis/sql_analyzer.py`、`models/query_log.py` | `constants/enums.ts`(BLOCKED_REASON_LABEL)、`pages/QueryCostPage.vue`、`pages/QueryDetailPage.vue` |
+| `PruneBlockReason` | `constants/enums.py`、`analysis/predicates.py`、`analysis/branches.py`、`analysis/sql_analyzer.py`、`models/query_log.py` | `constants/enums.ts`(BLOCKED_REASON_LABEL)、`pages/QueryCostPage.vue`、`pages/QueryDetailPage.vue` |
 | `AntiPattern` | `constants/enums.py`、`analysis/rewriter.py`、`analysis/scoring.py` | `constants/enums.ts`(ANTI_PATTERN_LABEL)、`pages/RewritePage.vue` |
 | `RiskLevel` | `constants/enums.py`、`analysis/scoring.py`、`models/rewrite_suggestion.py` | `constants/enums.ts`(RISK_LABEL)、`pages/RewritePage.vue` |
 | `RunStatus` / `SuggestionStatus` | `constants/enums.py`、`services/estimate_service.py`、`services/rewrite_service.py` | `constants/enums.ts`(RUN_STATUS_LABEL / SUGGESTION_STATUS_LABEL)、`pages/BudgetPage.vue` |

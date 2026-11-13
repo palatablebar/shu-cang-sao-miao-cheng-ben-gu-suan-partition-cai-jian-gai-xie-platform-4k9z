@@ -16,6 +16,18 @@ export interface RewriteSuggestion {
   score: number
   status: 'pending' | 'adopted' | 'rejected'
   rationale: string
+  publishable: boolean
+}
+
+export interface BranchCheck {
+  group_index: number
+  branch_index: number
+  expression_before: string
+  expression_after: string
+  status: 'identical' | 'proven' | 'unproven'
+  rules: string[]
+  unproven: string[]
+  note: string
 }
 
 export interface RewriteDetail extends RewriteSuggestion {
@@ -27,6 +39,8 @@ export interface RewriteDetail extends RewriteSuggestion {
   after_prunable: boolean
   after_hit_partition_count: number
   after_total_partition_count: number
+  branch_checks: BranchCheck[]
+  publish_blockers: string[]
 }
 
 export interface RewriteReevaluation {

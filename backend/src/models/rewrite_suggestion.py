@@ -1,7 +1,7 @@
 """RewriteSuggestion — 算法 2 产出的等价改写、风险级别与收益排序。"""
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -26,6 +26,9 @@ class RewriteSuggestion(Base, TimestampMixin):
     score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     rewritten_sql: Mapped[str] = mapped_column(Text, nullable=False, default="")
     rationale: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    publishable: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    branch_checks: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    publish_blockers: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     reviewed_by: Mapped[str | None] = mapped_column(String(80), nullable=True)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -36,6 +36,11 @@ def detail(db: Session, query_id: int) -> QueryDetail:
 
 
 def _apply_analysis(query: QueryLog, analysis: QueryAnalysis, cost_per_gib: float) -> None:
+    """把一次完整分析（含 OR 逐支结果）整体写入 ORM 对象。
+
+    只做多字段整体赋值，不碰数据库；调用方在同一事务里 commit —— 失败回滚时
+    旧版本的完整分析（含上一版 or_groups）原样保留，不会留下半套分支结果。
+    """
     query.parse_status = analysis.parse_status
     query.parse_error = analysis.parse_error
     query.target_table = analysis.target_table
@@ -43,6 +48,8 @@ def _apply_analysis(query: QueryLog, analysis: QueryAnalysis, cost_per_gib: floa
     query.blocked_reason = analysis.blocked_reason
     query.blocked_expression = analysis.blocked_expression
     query.predicates = analysis.predicates
+    query.or_groups = analysis.or_groups
+    query.or_group_count = analysis.or_group_count
     query.hit_partitions = analysis.hit_partitions
     query.hit_partition_count = analysis.hit_partition_count
     query.total_partition_count = analysis.total_partition_count
@@ -59,7 +66,7 @@ def _apply_analysis(query: QueryLog, analysis: QueryAnalysis, cost_per_gib: floa
 
 def analyze_and_store(db: Session, query: QueryLog, catalog=None) -> QueryAnalysis:
     catalog = catalog if catalog is not None else table_service.build_catalog(db)
-    analysis = analyze_query(query.sql_text, catalog)
+    analysis = analyze_query(query.sql_text, catalog, cost_per_gib_cny=settings.COST_PER_GIB_CNY)
     _apply_analysis(query, analysis, settings.COST_PER_GIB_CNY)
     return analysis
 

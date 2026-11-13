@@ -6,6 +6,7 @@ import { useQueryStore } from '../stores/queryStore'
 import { useRewriteStore } from '../stores/rewriteStore'
 import { fetchTable, fetchTables } from '../api/tables'
 import type { TablePartition } from '../types/table'
+import type { OrGroup } from '../types/query'
 import { useFeedback } from '../hooks/useFeedback'
 import BlueprintSheet from '../components/common/BlueprintSheet.vue'
 import BlueprintPanel from '../components/common/BlueprintPanel.vue'
@@ -25,11 +26,51 @@ const feedback = useFeedback()
 
 const partitions = ref<TablePartition[]>([])
 const busy = ref(false)
+const expanded = ref<Set<string>>(new Set())
 
 const detail = computed(() => store.detail)
 const id = computed(() => Number(route.params.id))
 
+function branchKey(groupIndex: number, branchIndex: number) {
+  return `${groupIndex}:${branchIndex}`
+}
+
+function toggleBranch(groupIndex: number, branchIndex: number) {
+  const key = branchKey(groupIndex, branchIndex)
+  const next = new Set(expanded.value)
+  if (next.has(key)) next.delete(key)
+  else next.add(key)
+  expanded.value = next
+}
+
+/** 支 → 组对账：各支命中分区的并集必须等于组汇总（并集去重）。 */
+function sumBranchHits(group: OrGroup): number {
+  return group.branches.reduce((total, branch) => total + branch.hit_partition_count, 0)
+}
+
+function branchUnion(group: OrGroup): Set<string> {
+  const union = new Set<string>()
+  for (const branch of group.branches) {
+    for (const dt of branch.hit_partitions) union.add(dt)
+  }
+  return union
+}
+
+function groupReconciled(group: OrGroup): boolean {
+  const union = branchUnion(group)
+  return union.size === group.union_partition_count && group.union_partitions.every((dt) => union.has(dt))
+}
+
+/** 组 → 整条对账：整条命中必须是每个组并集的子集（与其余约束取交）。 */
+function overallReconciled(): boolean {
+  if (!detail.value) return false
+  return detail.value.or_groups.every((group) =>
+    detail.value!.hit_partitions.every((dt) => group.union_partitions.includes(dt)),
+  )
+}
+
 async function load() {
+  expanded.value = new Set()
   const row = await store.loadDetail(id.value)
   partitions.value = []
   if (!row?.target_table) return
@@ -115,6 +156,84 @@ watch(id, load)
             </tbody>
           </table>
           <p v-else class="hint">该查询没有出现分区列谓词 —— 算法判定为「缺少分区谓词」，会扫描全部分区。</p>
+        </BlueprintPanel>
+
+        <BlueprintPanel v-if="detail.or_groups.length" :label="`OR 分支拆解 / OR BRANCHES（${detail.or_groups.length} 组）`">
+          <div v-for="group in detail.or_groups" :key="group.index" class="or-group">
+            <div class="or-head">
+              <span class="mono or-no">组 #{{ group.index + 1 }}</span>
+              <code class="or-expr">{{ group.expression }}</code>
+              <StatusStamp
+                :label="group.prunable ? '各支均可裁剪' : BLOCKED_REASON_LABEL[group.blocked_reason] || group.blocked_reason"
+                :level="group.prunable ? 'ok' : 'bad'"
+              />
+            </div>
+            <table class="grid-table branch-table">
+              <thead>
+                <tr>
+                  <th>支</th>
+                  <th>条件</th>
+                  <th>判定</th>
+                  <th class="num">命中分区</th>
+                  <th class="num">扫描量</th>
+                  <th class="num">单次费用</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                <template v-for="branch in group.branches" :key="branch.index">
+                  <tr class="branch-row" @click="toggleBranch(group.index, branch.index)">
+                    <td class="mono">#{{ branch.index + 1 }}</td>
+                    <td class="mono expr">{{ branch.expression }}</td>
+                    <td>
+                      <StatusStamp
+                        :label="branch.prunable ? '可裁剪' : BLOCKED_REASON_LABEL[branch.blocked_reason] || branch.blocked_reason"
+                        :level="branch.prunable ? 'ok' : 'bad'"
+                      />
+                    </td>
+                    <td class="num mono">{{ intLabel(branch.hit_partition_count) }} / {{ intLabel(detail.total_partition_count) }}</td>
+                    <td class="num mono">{{ gibLabel(branch.scan_bytes) }}</td>
+                    <td class="num mono">{{ cny(branch.cost_cny, 4) }}</td>
+                    <td class="mono toggle">{{ expanded.has(branchKey(group.index, branch.index)) ? '▾' : '▸' }}</td>
+                  </tr>
+                  <tr v-if="expanded.has(branchKey(group.index, branch.index))" class="branch-detail">
+                    <td colspan="7">
+                      <p class="hint" style="margin: 0 0 6px">{{ branch.note }}</p>
+                      <div class="row">
+                        <span class="hint">命中分区：</span>
+                        <span v-for="dt in branch.hit_partitions.slice(0, 14)" :key="dt" class="tag">{{ dt }}</span>
+                        <span v-if="branch.hit_partitions.length > 14" class="hint">+{{ branch.hit_partitions.length - 14 }}</span>
+                      </div>
+                      <p v-if="branch.blocked_expression" class="hint" style="margin: 6px 0 0">
+                        阻断表达式：<code>{{ branch.blocked_expression }}</code>
+                      </p>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+              <tfoot>
+                <tr>
+                  <td colspan="3">组并集（各支去重合并）</td>
+                  <td class="num mono">{{ intLabel(group.union_partition_count) }} / {{ intLabel(detail.total_partition_count) }}</td>
+                  <td class="num mono">{{ gibLabel(group.scan_bytes) }}</td>
+                  <td class="num mono">{{ cny(group.cost_cny, 4) }}</td>
+                  <td />
+                </tr>
+              </tfoot>
+            </table>
+            <p class="recon mono">
+              对账：Σ 各支命中 {{ intLabel(sumBranchHits(group)) }} 个分区 → 并集去重 {{ intLabel(group.union_partition_count) }} 个
+              <span :style="{ color: groupReconciled(group) ? 'var(--ok)' : 'var(--bad)' }">
+                {{ groupReconciled(group) ? '✓ 与组汇总一致' : '✗ 与组汇总不一致' }}
+              </span>
+              · 整条命中 {{ intLabel(detail.hit_partition_count) }} 个 ⊆ 组并集
+              <span :style="{ color: overallReconciled() ? 'var(--ok)' : 'var(--bad)' }">{{ overallReconciled() ? '✓' : '✗' }}</span>
+              · 汇总扫描 {{ gibLabel(detail.scan_bytes) }} · 费用 {{ cny(detail.scan_cost_cny, 4) }}
+            </p>
+          </div>
+          <p class="hint" style="margin: 8px 0 0">
+            各支费用之和 ≥ 组费用（并集去重）；整条费用按「组并集 ∩ 其余谓词」汇总，不等于任何单支费用。
+          </p>
         </BlueprintPanel>
 
         <BlueprintPanel label="算法结论 / RATIONALE">
@@ -204,6 +323,62 @@ watch(id, load)
   display: flex;
   flex-direction: column;
   gap: var(--space-4);
+}
+.or-group {
+  border: 1px solid var(--rule);
+  padding: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+.or-group:last-of-type {
+  margin-bottom: 0;
+}
+.or-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-2);
+}
+.or-no {
+  font-size: 0.72rem;
+  color: var(--cream);
+}
+.or-expr {
+  font-size: 0.7rem;
+  color: var(--cream-dim);
+  word-break: break-all;
+}
+.branch-table .expr {
+  word-break: break-all;
+  font-size: 0.7rem;
+}
+.branch-row {
+  cursor: pointer;
+}
+.branch-row:hover {
+  background: oklch(0.32 0.05 252 / 0.5);
+}
+.branch-detail td {
+  background: oklch(0.24 0.045 254 / 0.6);
+  border-bottom: 1px dashed var(--rule);
+  padding: 8px 10px;
+}
+.toggle {
+  color: var(--cream-mute);
+  text-align: right;
+}
+.branch-table tfoot td {
+  border-top: 1px solid var(--rule-strong);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--sand);
+  padding-top: 6px;
+}
+.recon {
+  margin: 8px 0 0;
+  font-size: 0.66rem;
+  color: var(--cream-mute);
+  line-height: 1.7;
 }
 .kv {
   display: flex;

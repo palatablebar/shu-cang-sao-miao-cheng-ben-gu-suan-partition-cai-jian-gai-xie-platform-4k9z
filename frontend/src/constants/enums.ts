@@ -11,6 +11,7 @@ export const BLOCKED_REASON_LABEL: Record<string, string> = {
   implicit_cast: '隐式类型转换',
   missing_predicate: '缺少分区谓词',
   expression_not_usable: '表达式不可裁剪',
+  non_partition_filter: '分支不含分区列',
   table_not_partitioned: '表未分区',
   unparsed: '解析失败',
   missing_table: '目标表缺失',
@@ -22,9 +23,16 @@ export const BLOCKED_REASON_SHORT: Record<string, string> = {
   implicit_cast: '隐式转换',
   missing_predicate: '缺谓词',
   expression_not_usable: '表达式',
+  non_partition_filter: '非分区支',
   table_not_partitioned: '未分区',
   unparsed: '解析失败',
   missing_table: '表缺失',
+}
+
+export const BRANCH_CHECK_LABEL: Record<string, string> = {
+  identical: '未改动 · 恒等',
+  proven: '规则等价',
+  unproven: '无法证明等价',
 }
 
 export const ANTI_PATTERN_LABEL: Record<string, string> = {

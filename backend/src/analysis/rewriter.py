@@ -7,6 +7,13 @@
 3. ``select_star``              投影为 *                              → 替换为表元数据登记的建议投影列（中风险）
 4. ``missing_partition_predicate`` 无分区谓词                          → 补最近 N 天时间窗口（高风险）
 
+OR 组逐支等价核对
+-----------------
+OR 组必须**逐支**改写并核对等价性：每一支要么未改动（恒等），要么命中已知
+等价规则（去函数包裹 / 字面量归一化）。任一支无法证明等价 → ``publishable=False``
+→ 整条建议不予发布（服务层 409），避免「局部改写被发布、另一支丢记录」。
+含 OR 组的查询绝不补时间窗口（窗口会收窄某一支、丢掉另一支的记录）。
+
 风险/置信度/排序见 ``src/analysis/scoring.py``；改写后的扫描字节由
 ``analyze_query`` 对改写文本重新求解得到，前端不参与任何估算。
 """
@@ -20,7 +27,7 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
-from src.analysis.predicates import PartitionPredicate, build_predicate, split_and
+from src.analysis.predicates import PartitionPredicate, build_predicate, split_and, split_or
 from src.analysis.scoring import confidence_for, risk_level_for, score_of
 from src.analysis.sql_analyzer import GIB, QueryAnalysis, TableProfile, analyze_query
 
@@ -35,6 +42,7 @@ MIN_SAVING_RATIO = 0.05
 @dataclass
 class RewriteResult:
     rewritable: bool = False
+    publishable: bool = False
     rewritten_sql: str = ""
     anti_patterns: list[str] = field(default_factory=list)
     risk_level: str = "medium"
@@ -48,6 +56,8 @@ class RewriteResult:
     saving_pct: float = 0.0
     score: float = 0.0
     fixes: list[str] = field(default_factory=list)
+    branch_checks: list[dict] = field(default_factory=list)
+    publish_blockers: list[str] = field(default_factory=list)
     rationale: str = ""
     note: str = ""
 
@@ -161,6 +171,90 @@ def _window_predicate(profile: TableProfile, window_days: int) -> exp.Expression
     return exp.GTE(this=exp.column(profile.partition_key.lower()), expression=exp.Literal.string(start.isoformat()))
 
 
+def _unwrap_or_branches(
+    or_conjuncts: list[tuple[exp.Expression, list[exp.Expression]]],
+    partition_key: str,
+    partition_type: str,
+    anti_patterns: list[str],
+    fixes: list[str],
+) -> list[dict]:
+    """逐支改写 OR 组并记录等价核对结果（identical / proven / unproven）。
+
+    注意：``node.replace`` 会把被替换的分支节点从树上摘下，因此这里只记录
+    改写前文本与命中的规则；改写后文本由 ``_refresh_branch_after_sql``
+    在全部改写完成后从最新语法树重新切分得到。
+    """
+    checks: list[dict] = []
+    for group_index, (_group_node, branch_nodes) in enumerate(or_conjuncts):
+        for branch_index, branch_node in enumerate(branch_nodes):
+            before_sql = branch_node.sql(dialect="postgres")
+            rules: list[str] = []
+            unproven: list[str] = []
+            for sub in split_and(branch_node):
+                predicate = build_predicate(sub, partition_key.lower(), partition_type)
+                if predicate is None or predicate.usable:
+                    continue
+                rebuilt = None
+                if predicate.operator not in ("and", "or") and predicate.reason in (
+                    "function_wrapped",
+                    "implicit_cast",
+                ):
+                    rebuilt = _unwrap_partition_predicate(predicate, partition_key)
+                if rebuilt is not None and predicate.node is not None:
+                    original_sql = predicate.expression_sql
+                    predicate.node.replace(rebuilt)
+                    pattern = ANTI_FUNCTION if predicate.reason == "function_wrapped" else ANTI_CAST
+                    if pattern not in anti_patterns:
+                        anti_patterns.append(pattern)
+                    new_sql = rebuilt.sql(dialect="postgres")
+                    rules.append(f"`{original_sql}` → `{new_sql}`")
+                    fixes.append(
+                        f"OR 组 #{group_index + 1} 支 #{branch_index + 1}：分区谓词 `{original_sql}` "
+                        f"改为裸列比较 `{new_sql}`，恢复该支分区裁剪"
+                    )
+                else:
+                    unproven.append(f"{predicate.expression_sql}（{predicate.reason}，无等价改写规则）")
+            if unproven:
+                status = "unproven"
+                note = f"支内含无法证明等价的谓词：{'；'.join(unproven)}"
+            elif rules:
+                status = "proven"
+                note = f"等价规则改写：{'；'.join(rules)}"
+            else:
+                status = "identical"
+                note = "该支未改动（恒等）"
+            checks.append(
+                {
+                    "group_index": group_index,
+                    "branch_index": branch_index,
+                    "expression_before": before_sql,
+                    "expression_after": before_sql,  # 占位，由 _refresh_branch_after_sql 回填
+                    "status": status,
+                    "rules": rules,
+                    "unproven": unproven,
+                    "note": note,
+                }
+            )
+    return checks
+
+
+def _refresh_branch_after_sql(select: exp.Select, checks: list[dict]) -> None:
+    """全部改写落树后，重新切分 WHERE 的 OR 组，回填每一支的改写后文本。"""
+    if not checks:
+        return
+    where = select.args.get("where")
+    fresh_groups: list[list[exp.Expression]] = []
+    for conjunct in split_and(where.this if where else None):
+        branches = split_or(conjunct)
+        if len(branches) > 1:
+            fresh_groups.append(branches)
+    for check in checks:
+        group_idx = check["group_index"]
+        branch_idx = check["branch_index"]
+        if group_idx < len(fresh_groups) and branch_idx < len(fresh_groups[group_idx]):
+            check["expression_after"] = fresh_groups[group_idx][branch_idx].sql(dialect="postgres")
+
+
 def build_rewrite(
     sql: str,
     catalog: dict[str, TableProfile],
@@ -169,7 +263,7 @@ def build_rewrite(
     risk_weights: dict[str, float] | None = None,
 ) -> RewriteResult:
     """Detect anti-patterns, produce an equivalent rewrite and re-estimate it."""
-    before = analyze_query(sql, catalog)
+    before = analyze_query(sql, catalog, cost_per_gib_cny=cost_per_gib_cny)
     result = RewriteResult(before=before, before_scan_bytes=before.scan_bytes)
     if before.parse_status != "parsed":
         result.note = before.rationale or "SQL 解析失败，无法生成改写"
@@ -197,7 +291,12 @@ def build_rewrite(
     where = select.args.get("where")
     conjuncts = split_and(where.this if where else None)
     predicates: list[PartitionPredicate] = []
+    or_conjuncts: list[tuple[exp.Expression, list[exp.Expression]]] = []
     for conjunct in conjuncts:
+        branches = split_or(conjunct)
+        if len(branches) > 1:
+            or_conjuncts.append((conjunct, branches))
+            continue
         predicate = build_predicate(conjunct, partition_key.lower(), profile.partition_type)
         if predicate is not None:
             predicates.append(predicate)
@@ -221,7 +320,20 @@ def build_rewrite(
                 f"分区谓词 `{original_sql}` 改为裸列比较 `{rebuilt.sql(dialect='postgres')}`，恢复分区裁剪"
             )
 
-    if before.blocked_reason == "missing_predicate":
+    # OR 组逐支改写 + 等价核对；任一支无法证明等价 → 整条建议不予发布。
+    branch_checks = _unwrap_or_branches(
+        or_conjuncts, partition_key, profile.partition_type, anti_patterns, fixes
+    )
+    result.branch_checks = branch_checks
+    result.publish_blockers = [
+        f"OR 组 #{check['group_index'] + 1} 支 #{check['branch_index'] + 1} 无法证明等价："
+        + "；".join(check["unproven"])
+        for check in branch_checks
+        if check["status"] == "unproven"
+    ]
+
+    # 补时间窗口会收窄语义范围；含 OR 组时绝不能补（会丢掉另一支的记录）。
+    if before.blocked_reason == "missing_predicate" and not or_conjuncts:
         window = _window_predicate(profile, window_days)
         if window is not None:
             existing = select.args.get("where")
@@ -245,12 +357,15 @@ def build_rewrite(
 
     if not anti_patterns:
         result.note = "未命中可改写的反模式（谓词与投影都合规）"
+        if result.publish_blockers:
+            result.note += "；" + "；".join(result.publish_blockers)
         return result
 
+    _refresh_branch_after_sql(select, branch_checks)
     rewritten_sql = tree.sql(dialect="postgres", pretty=True)
 
     # 收益重估：对改写后的 SQL 重新跑算法 1，而不是用系数猜。
-    after = analyze_query(rewritten_sql, catalog)
+    after = analyze_query(rewritten_sql, catalog, cost_per_gib_cny=cost_per_gib_cny)
     result.after = after
     result.rewritten_sql = rewritten_sql
     result.anti_patterns = sorted(anti_patterns)
@@ -263,10 +378,16 @@ def build_rewrite(
     result.score = score_of(result.saving_bytes, result.confidence, result.risk_level, risk_weights)
     result.fixes = fixes
     result.rewritable = result.saving_bytes > 0 and (result.saving_pct / 100) >= MIN_SAVING_RATIO
+    result.publishable = result.rewritable and not result.publish_blockers
     result.rationale = (
         f"命中 {len(anti_patterns)} 类反模式；改写前扫描 {before.scan_bytes / GIB:.2f} GiB → "
         f"改写后 {after.scan_bytes / GIB:.2f} GiB，节省 {result.saving_pct:.1f}%；"
         f"风险 {result.risk_level}，置信度 {result.confidence:.2f}，"
         f"排序分 score = {result.saving_bytes} B × {result.confidence:.2f} ÷ 风险权重 = {result.score:.0f}"
     )
+    if branch_checks:
+        if result.publish_blockers:
+            result.rationale += "；存在无法证明等价的 OR 分支，整条建议不予发布"
+        else:
+            result.rationale += f"；{len(branch_checks)} 条 OR 支全部通过等价核对"
     return result

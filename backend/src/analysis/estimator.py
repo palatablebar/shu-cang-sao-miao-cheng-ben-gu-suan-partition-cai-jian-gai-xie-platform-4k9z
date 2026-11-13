@@ -38,7 +38,7 @@ def estimate_queries(
     """Estimate every (query_id, sql) pair against the metadata catalog."""
     summary = EstimateSummary()
     for query_id, sql in items:
-        analysis = analyze_query(sql, catalog)
+        analysis = analyze_query(sql, catalog, cost_per_gib_cny=cost_per_gib_cny)
         summary.rows.append(EstimateRow(query_id=query_id, analysis=analysis))
         if analysis.parse_status != "parsed":
             continue

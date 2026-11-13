@@ -5,8 +5,8 @@ from src.models import AuditLog, BudgetPolicy, EstimateRun, QueryLog, RewriteSug
 from src.schemas.audit import AuditOut
 from src.schemas.budget import PolicyOut
 from src.schemas.estimate import EstimateRunOut
-from src.schemas.query import PredicateOut, QueryDetail, QueryListItem
-from src.schemas.rewrite import RewriteDetail, RewriteOut
+from src.schemas.query import BranchOut, OrGroupOut, PredicateOut, QueryDetail, QueryListItem
+from src.schemas.rewrite import BranchCheckOut, RewriteDetail, RewriteOut
 from src.schemas.table import ColumnOut, PartitionOut, TableDetail, TableListItem
 
 
@@ -80,11 +80,20 @@ def _query_base(query: QueryLog) -> dict:
         hit_partition_count=query.hit_partition_count,
         total_partition_count=query.total_partition_count,
         col_ratio=query.col_ratio,
+        or_group_count=query.or_group_count,
     )
 
 
 def query_item(query: QueryLog) -> QueryListItem:
     return QueryListItem(**_query_base(query))
+
+
+def _or_groups(query: QueryLog) -> list[OrGroupOut]:
+    groups = []
+    for group in query.or_groups if isinstance(query.or_groups, list) else []:
+        branches = [BranchOut(**branch) for branch in group.get("branches", [])]
+        groups.append(OrGroupOut(**{**group, "branches": branches}))
+    return groups
 
 
 def query_detail(query: QueryLog, suggestion_count: int = 0) -> QueryDetail:
@@ -97,6 +106,7 @@ def query_detail(query: QueryLog, suggestion_count: int = 0) -> QueryDetail:
         parse_error=query.parse_error,
         blocked_expression=query.blocked_expression,
         predicates=predicates,
+        or_groups=_or_groups(query),
         hit_partitions=list(query.hit_partitions or []),
         projected_columns=list(query.projected_columns or []),
         referenced_columns=list(query.referenced_columns or []),
@@ -152,6 +162,7 @@ def rewrite_base(suggestion: RewriteSuggestion) -> dict:
         score=suggestion.score,
         status=suggestion.status,
         rationale=suggestion.rationale,
+        publishable=bool(suggestion.publishable),
     )
 
 
@@ -162,8 +173,13 @@ def rewrite_item(suggestion: RewriteSuggestion) -> RewriteOut:
 def rewrite_detail(suggestion: RewriteSuggestion, extra: dict) -> RewriteDetail:
     query = suggestion.query
     original_sql = query.sql_text if query else ""
+    checks = extra.get("branch_checks", suggestion.branch_checks or [])
+    blockers = extra.get("publish_blockers", suggestion.publish_blockers or [])
+    base = rewrite_base(suggestion)
+    if "publishable" in extra:
+        base["publishable"] = bool(extra["publishable"])
     return RewriteDetail(
-        **rewrite_base(suggestion),
+        **base,
         original_sql=original_sql,
         rewritten_sql=suggestion.rewritten_sql,
         fixes=extra.get("fixes", []),
@@ -172,6 +188,8 @@ def rewrite_detail(suggestion: RewriteSuggestion, extra: dict) -> RewriteDetail:
         after_prunable=extra.get("after_prunable", False),
         after_hit_partition_count=extra.get("after_hit_partition_count", 0),
         after_total_partition_count=extra.get("after_total_partition_count", 0),
+        branch_checks=[BranchCheckOut(**check) for check in checks],
+        publish_blockers=list(blockers),
     )
 
 

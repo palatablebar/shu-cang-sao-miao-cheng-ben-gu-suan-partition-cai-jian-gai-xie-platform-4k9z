@@ -12,7 +12,7 @@ import EmptyState from '../components/common/EmptyState.vue'
 import ErrorNotice from '../components/common/ErrorNotice.vue'
 import MonoMetric from '../components/common/MonoMetric.vue'
 import StatusStamp from '../components/common/StatusStamp.vue'
-import { ANTI_PATTERN_LABEL, RISK_LABEL, SUGGESTION_STATUS_LABEL } from '../constants/enums'
+import { ANTI_PATTERN_LABEL, BRANCH_CHECK_LABEL, RISK_LABEL, SUGGESTION_STATUS_LABEL } from '../constants/enums'
 import { MSG_EMPTY_REWRITE } from '../constants/messages'
 import { cny, gibLabel, pct, ratio, scoreLabel } from '../utils/format'
 
@@ -191,6 +191,44 @@ onMounted(load)
             <p class="hint" style="margin: 0">{{ detail.rationale }}</p>
           </BlueprintPanel>
 
+          <div v-if="!detail.publishable" class="notice" style="margin-top: var(--space-3)">
+            <span class="mono">不予发布</span>
+            <span>
+              任一支无法证明等价，整条建议都不能发布：
+              {{ detail.publish_blockers.join('；') || '等价核对未通过' }}
+            </span>
+          </div>
+
+          <BlueprintPanel v-if="detail.branch_checks.length" label="OR 分支等价核对 / BRANCH EQUIVALENCE">
+            <table class="grid-table">
+              <thead>
+                <tr>
+                  <th>组 / 支</th>
+                  <th>改写前</th>
+                  <th>改写后</th>
+                  <th>核对</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="check in detail.branch_checks" :key="`${check.group_index}-${check.branch_index}`">
+                  <td class="mono">#{{ check.group_index + 1 }}.{{ check.branch_index + 1 }}</td>
+                  <td class="mono check-expr">{{ check.expression_before }}</td>
+                  <td class="mono check-expr">{{ check.expression_after }}</td>
+                  <td>
+                    <StatusStamp
+                      :label="BRANCH_CHECK_LABEL[check.status] || check.status"
+                      :level="check.status === 'unproven' ? 'bad' : 'ok'"
+                    />
+                    <p class="hint" style="margin: 4px 0 0">{{ check.note }}</p>
+                  </td>
+                </tr>
+              </tbody>
+            </table>
+            <p class="hint" style="margin: 8px 0 0">
+              口径：每一支要么未改动（恒等），要么命中已知等价规则；任一支无法证明等价 → 整条建议不予发布。
+            </p>
+          </BlueprintPanel>
+
           <div class="metrics">
             <MonoMetric :value="gibLabel(detail.saving_bytes)" caption="节省扫描 / SAVING" />
             <MonoMetric :value="pct(detail.saving_pct)" caption="节省比例" />
@@ -211,7 +249,13 @@ onMounted(load)
               <button class="btn btn--primary" type="button" :disabled="busy === 'reevaluate'" @click="reevaluate">
                 {{ busy === 'reevaluate' ? '重估中…' : '重估节省' }}
               </button>
-              <button class="btn" type="button" :disabled="busy === 'adopt' || detail.status === 'adopted'" @click="adopt">
+              <button
+                class="btn"
+                type="button"
+                :disabled="busy === 'adopt' || detail.status === 'adopted' || !detail.publishable"
+                :title="detail.publishable ? '' : '存在无法证明等价的 OR 分支，不能采纳'"
+                @click="adopt"
+              >
                 {{ detail.status === 'adopted' ? '已采纳' : '采纳建议' }}
               </button>
             </template>
@@ -356,6 +400,10 @@ tbody tr {
 .sql-block--before {
   border-left-color: var(--cream-mute);
   color: var(--cream-dim);
+}
+.check-expr {
+  word-break: break-all;
+  font-size: 0.7rem;
 }
 .fixes {
   margin: 0 0 var(--space-3);

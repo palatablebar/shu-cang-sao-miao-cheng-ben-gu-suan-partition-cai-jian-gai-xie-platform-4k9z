@@ -148,7 +148,10 @@ def seed_queries(db) -> int:
         query.query_date = row["query_date"]
         query.duration_ms = row["duration_ms"]
         query.is_scheduled = row["is_scheduled"]
-        query_service._apply_analysis(query, analyze_query(query.sql_text, catalog), settings.COST_PER_GIB_CNY)
+        query_service._apply_analysis(
+            query, analyze_query(query.sql_text, catalog, cost_per_gib_cny=settings.COST_PER_GIB_CNY),
+            settings.COST_PER_GIB_CNY,
+        )
     db.commit()
     _log(f"queries created={created} total={len(demo_dataset.build_queries())}")
     return created
@@ -260,7 +263,7 @@ def expected_suggestion_nos(db) -> list[str]:
             window_days=settings.REWRITE_WINDOW_DAYS,
             cost_per_gib_cny=settings.COST_PER_GIB_CNY,
         )
-        if result.rewritable:
+        if result.rewritable and result.publishable:
             scored.append((query, result))
     scored.sort(key=lambda item: (-item[1].score, item[0].external_id))
     return [rewrite_service.suggestion_no_for(query) for query, _ in scored[:12]]

@@ -181,6 +181,7 @@ onMounted(loadAll)
                     :label="BLOCKED_REASON_SHORT[item.blocked_reason] || item.blocked_reason"
                     :level="item.prunable ? 'prunable' : 'blocked'"
                   />
+                  <span v-if="item.or_group_count" class="tag tag--rust" style="margin-left: 6px">OR×{{ item.or_group_count }}</span>
                 </td>
                 <td class="num mono">{{ item.hit_partition_count }}/{{ item.total_partition_count }}</td>
                 <td class="num">

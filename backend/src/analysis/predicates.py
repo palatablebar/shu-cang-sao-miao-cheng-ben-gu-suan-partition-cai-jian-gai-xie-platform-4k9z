@@ -64,6 +64,21 @@ def split_and(node: exp.Expression | None) -> list[exp.Expression]:
     return [node]
 
 
+def split_or(node: exp.Expression | None) -> list[exp.Expression]:
+    """Flatten a top-level disjunction into its branches（OR 支）.
+
+    只展开「以 OR 连接」的节点；AND / 比较 / NOT 等节点原样返回单元素列表，
+    调用方据此判断一个合取项是不是 OR 组（len > 1）。
+    """
+    if node is None:
+        return []
+    if isinstance(node, exp.Paren):
+        return split_or(node.this)
+    if isinstance(node, exp.Or):
+        return split_or(node.this) + split_or(node.expression)
+    return [node]
+
+
 def _literal_value(node: exp.Expression | None) -> tuple[str, str] | None:
     """Return (python-agnostic sql text, kind) for a literal node, else None."""
     if node is None:

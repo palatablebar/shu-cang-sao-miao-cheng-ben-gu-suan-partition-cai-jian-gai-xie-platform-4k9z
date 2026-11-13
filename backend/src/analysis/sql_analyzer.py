@@ -25,12 +25,14 @@ import sqlglot
 from sqlglot import exp
 from sqlglot.errors import ParseError
 
+from src.analysis.branches import analyze_or_group
 from src.analysis.predicates import (
     BLOCK_EXPRESSION,
     PartitionPredicate,
     build_predicate,
     partition_filter,
     split_and,
+    split_or,
 )
 
 GIB = 1024 ** 3
@@ -94,6 +96,8 @@ class QueryAnalysis:
     blocked_reason: str = "none"
     blocked_expression: str | None = None
     predicates: list[dict] = field(default_factory=list)
+    or_groups: list[dict] = field(default_factory=list)
+    or_group_count: int = 0
     hit_partitions: list[str] = field(default_factory=list)
     hit_partition_count: int = 0
     total_partition_count: int = 0
@@ -164,8 +168,15 @@ def _collect_references(tree: exp.Expression, table: exp.Table, profile: TablePr
     return names
 
 
-def analyze_query(sql: str, catalog: dict[str, TableProfile]) -> QueryAnalysis:
-    """把一条 SQL 变成可解释的扫描量估算结果（纯函数，不碰数据库）。"""
+def analyze_query(
+    sql: str,
+    catalog: dict[str, TableProfile],
+    cost_per_gib_cny: float | None = None,
+) -> QueryAnalysis:
+    """把一条 SQL 变成可解释的扫描量估算结果（纯函数，不碰数据库）。
+
+    ``cost_per_gib_cny`` 提供时，OR 组/支会顺带算出费用（元），否则记 0。
+    """
     try:
         tree = sqlglot.parse_one(sql, read="postgres")
     except ParseError as exc:
@@ -223,8 +234,15 @@ def analyze_query(sql: str, catalog: dict[str, TableProfile]) -> QueryAnalysis:
 
     where = select.args.get("where")
     conjuncts = split_and(where.this if where else None)
+    # 顶层合取项分两类：普通谓词（含 AND 复合）与 OR 组。OR 组必须逐支估算，
+    # 否则「日期支命中 1 个分区」会被当成整条查询的扫描量。
     predicate_list: list[PartitionPredicate] = []
+    or_conjuncts: list[tuple[exp.Expression, list[exp.Expression]]] = []
     for conjunct in conjuncts:
+        branches = split_or(conjunct)
+        if len(branches) > 1:
+            or_conjuncts.append((conjunct, branches))
+            continue
         predicate = build_predicate(conjunct, profile.partition_key.lower(), profile.partition_type)
         if predicate is not None:
             predicate_list.append(predicate)
@@ -249,15 +267,43 @@ def analyze_query(sql: str, catalog: dict[str, TableProfile]) -> QueryAnalysis:
         projected = []
         col_ratio = COUNT_STAR_RATIO
         ratio_note = "仅聚合/计数，按最小列比例"
+    # 列裁剪比例只舍入一次：落库的比例、支/组/整条扫描量都用同一个值，
+    # 保证「扫描量 = 命中字节 × 列裁剪比例」在页面上能精确对账。
+    col_ratio = round(col_ratio, 6)
 
-    if usable:
-        filters = [partition_filter(p) for p in usable]
-        hit = [dt for dt, _ in profile.partitions if all(fn(dt) for fn in filters if fn)]
+    # OR 组逐支拆解（需要先有 col_ratio 才能算支级扫描量/费用）。
+    or_groups = [
+        analyze_or_group(index, node, branches, profile, col_ratio, cost_per_gib_cny)
+        for index, (node, branches) in enumerate(or_conjuncts)
+    ]
+    blocked_groups = [group for group in or_groups if not group.prunable]
+
+    # 整条命中 = 普通可用谓词的交集 ∩ 各 OR 组并集；没有任何约束 → 全部分区。
+    all_dts = [dt for dt, _ in profile.partitions]
+    constraint_sets: list[set[str]] = []
+    for predicate in usable:
+        fn = partition_filter(predicate)
+        if fn is not None:
+            constraint_sets.append({dt for dt in all_dts if fn(dt)})
+    for group in or_groups:
+        constraint_sets.append(set(group.union_partitions))
+    if constraint_sets:
+        hit = [dt for dt in all_dts if all(dt in constraint for constraint in constraint_sets)]
+    else:
+        hit = list(all_dts)
+
+    if blocked_groups:
+        # 任一支不可裁剪 → 整条判定为裁剪失效（命中仍按交集如实计算）。
+        first_group = blocked_groups[0]
+        blocking_branch = next((b for b in first_group.branches if not b.prunable), None)
+        prunable = False
+        blocked_reason = first_group.blocked_reason
+        blocked_expression = blocking_branch.blocked_expression if blocking_branch else None
+    elif usable or or_groups:
         prunable = True
         blocked_reason = "none"
         blocked_expression = None
     else:
-        hit = [dt for dt, _ in profile.partitions]
         prunable = False
         if blocked:
             first = blocked[0]
@@ -295,12 +341,16 @@ def analyze_query(sql: str, catalog: dict[str, TableProfile]) -> QueryAnalysis:
             "implicit_cast": "分区列与字面量类型不一致（隐式转换）",
             "expression_not_usable": "分区列参与复杂表达式",
             "missing_predicate": "缺少分区谓词",
+            "non_partition_filter": "OR 分支不含分区列谓词",
         }.get(blocked_reason, blocked_reason)
         rationale = (
             f"{profile.table_name}（{len(profile.partitions)} 个日分区）{reason_text} → 裁剪失效，"
-            f"命中全部 {len(hit)} 个分区（{_fmt_gib(hit_bytes)}）× 列裁剪比例 {col_ratio:.2f}"
+            f"命中 {len(hit)} 个分区（{_fmt_gib(hit_bytes)}）× 列裁剪比例 {col_ratio:.2f}"
             f"（{ratio_note}）= {_fmt_gib(scan_bytes)}"
         )
+    if or_groups:
+        group_notes = "；".join(f"OR 组 #{group.index + 1}（{group.note}）" for group in or_groups)
+        rationale += f"。OR 逐支拆解：{group_notes}"
 
     return QueryAnalysis(
         parsed=True,
@@ -311,11 +361,13 @@ def analyze_query(sql: str, catalog: dict[str, TableProfile]) -> QueryAnalysis:
         blocked_reason=blocked_reason,
         blocked_expression=blocked_expression,
         predicates=predicates_payload,
+        or_groups=[group.to_dict() for group in or_groups],
+        or_group_count=len(or_groups),
         hit_partitions=hit,
         hit_partition_count=len(hit),
         total_partition_count=len(profile.partitions),
         hit_bytes=hit_bytes,
-        col_ratio=round(col_ratio, 6),
+        col_ratio=col_ratio,
         projected_columns=projected,
         referenced_columns=references,
         has_star=has_star,

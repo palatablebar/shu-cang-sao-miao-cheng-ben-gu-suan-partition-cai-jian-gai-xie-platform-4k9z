@@ -4,7 +4,7 @@
 因此这里的每一个字节数都是可复现的：分区字节、列字节都由固定权重归一化得到。
 
 规模契约（batch-plan gb-570）：
-    tables=6  partitions=90  queries=60（其中 18 条裁剪失效）  estimates=2  suggestions=12  users=3
+    tables=6  partitions=90  queries=60（其中 21 条裁剪失效，含 3 条 OR 多支）  estimates=2  suggestions=12  users=3
 """
 from __future__ import annotations
 
@@ -308,10 +308,12 @@ def _pick(dates: list[str], index: int) -> str:
 
 
 def build_queries(tables: list[dict] | None = None) -> list[dict]:
-    """Deterministic 60-row query log: 18 blocked (10 wrapped / 8 implicit cast... ) + 42 prunable.
+    """Deterministic 60-row query log: 21 blocked + 39 prunable（含 5 条 OR 多支查询）.
 
-    裁剪失效构成（与 batch-plan 对齐）：
-        6 条 分区列函数包裹、8 条 隐式类型转换、4 条 缺分区谓词 = 18 条
+    裁剪失效构成：
+        6 条 分区列函数包裹、8 条 隐式类型转换、4 条 缺分区谓词、
+        3 条 OR 多支（状态支扫全表 / 一支函数包裹 / 一支无法证明等价）= 21 条
+    OR 组另外 2 条可裁剪（双日期支并集、区间+单日并集），用于展示逐支命中与并集汇总。
     其中 QL-0007（dwd_order_detail + to_char 包裹 + SELECT *）是全量扫描 Top1。
     """
     table_map = {t["table_name"]: t for t in (tables or build_tables())}
@@ -534,6 +536,64 @@ def build_queries(tables: list[dict] | None = None) -> list[dict]:
         118_000,
     )
 
+    # --- 4. OR 多支组合（5 条）：运营常把多个条件用或关系拼在一起 ---
+    # QL-0019 日期支命中 1 个分区、状态支扫全表 → 整条按并集记全表扫描
+    add(
+        dd,
+        "成交明细按日期或状态兜底拉取（OR 状态支）",
+        f"SELECT order_id, buyer_id, gmv, order_status, create_time FROM dwd_order_detail\n"
+        f"WHERE dt = '{_pick(dates[dd], 28)}' OR order_status = 'PAID'",
+        "adhoc",
+        ENGINEER,
+        28,
+        452_000,
+    )
+    # QL-0020 双日期支 → 并集 2 个分区，可裁剪
+    add(
+        ods,
+        "大促两日订单量对比（OR 双日期支）",
+        f"SELECT order_id, user_id, pay_amount FROM ods_order_raw\n"
+        f"WHERE dt = '{_pick(dates[ods], 17)}' OR dt = '{_pick(dates[ods], 18)}'",
+        "finebi",
+        ENGINEER,
+        17,
+        64_000,
+    )
+    # QL-0021 一支函数包裹 + 一支裸列 → 逐支改写后两支都可证明等价，建议可发布
+    add(
+        pay,
+        "支付流水两日核对（OR 一支函数包裹）",
+        f"SELECT pay_id, order_id, pay_amount FROM dwd_payment_flow\n"
+        f"WHERE to_char(dt, 'YYYY-MM-DD') = '{_pick(dates[pay], 9)}' OR dt = '{_pick(dates[pay], 10)}'",
+        "metabase",
+        ENGINEER,
+        10,
+        71_000,
+    )
+    # QL-0022 一支 substr 可改写、一支 coalesce 无法证明等价 → 整条建议不予发布
+    add(
+        dws,
+        "店铺月汇总与单日补数（OR 一支无法证明等价）",
+        f"SELECT shop_id, order_cnt FROM dws_trade_summary\n"
+        f"WHERE substr(dt, 1, 7) = '{_pick(dates[dws], 8)[:7]}' OR coalesce(dt, '') = '{_pick(dates[dws], 8)}'",
+        "superset",
+        ENGINEER,
+        8,
+        58_000,
+    )
+    # QL-0023 区间支 + 单日支 → 并集 5 个分区，可裁剪
+    add(
+        sales,
+        "类目销售周区间或单日补数（OR 区间+单日）",
+        f"SELECT cate_name, sale_amount FROM ads_sales_daily\n"
+        f"WHERE dt BETWEEN '{_pick(dates[sales], 3)}' AND '{_pick(dates[sales], 6)}' "
+        f"OR dt = '{_pick(dates[sales], 8)}'",
+        "adhoc",
+        ADMIN,
+        6,
+        33_000,
+    )
+
     column_sets = {
         dd: ["order_id", "buyer_id", "shop_id", "gmv", "pay_amount", "order_status", "channel", "create_time"],
         ods: ["order_id", "user_id", "shop_id", "amount", "pay_amount", "channel"],
@@ -543,12 +603,12 @@ def build_queries(tables: list[dict] | None = None) -> list[dict]:
         member: ["member_id", "value_tier", "gmv_90d", "churn_score"],
     }
 
-    # --- 4. 42 条裸列谓词（可裁剪） ---
+    # --- 5. 37 条裸列谓词（可裁剪） ---
     plan = [
-        (dd, 13),
-        (ods, 7),
-        (pay, 6),
-        (dws, 6),
+        (dd, 11),
+        (ods, 6),
+        (pay, 5),
+        (dws, 5),
         (sales, 6),
         (member, 4),
     ]

@@ -16,6 +16,7 @@ export interface QueryListItem {
   hit_partition_count: number
   total_partition_count: number
   col_ratio: number
+  or_group_count: number
 }
 
 export interface Predicate {
@@ -27,11 +28,42 @@ export interface Predicate {
   wrapper_kind: string | null
 }
 
+export interface OrBranch {
+  index: number
+  expression: string
+  touches_partition_key: boolean
+  prunable: boolean
+  blocked_reason: string
+  blocked_expression: string | null
+  predicates: Predicate[]
+  hit_partitions: string[]
+  hit_partition_count: number
+  hit_bytes: number
+  scan_bytes: number
+  cost_cny: number
+  note: string
+}
+
+export interface OrGroup {
+  index: number
+  expression: string
+  prunable: boolean
+  blocked_reason: string
+  branches: OrBranch[]
+  union_partitions: string[]
+  union_partition_count: number
+  union_bytes: number
+  scan_bytes: number
+  cost_cny: number
+  note: string
+}
+
 export interface QueryDetail extends QueryListItem {
   sql_text: string
   parse_error: string | null
   blocked_expression: string | null
   predicates: Predicate[]
+  or_groups: OrGroup[]
   hit_partitions: string[]
   projected_columns: string[]
   referenced_columns: string[]

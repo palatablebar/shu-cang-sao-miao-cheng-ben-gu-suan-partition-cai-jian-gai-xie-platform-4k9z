@@ -30,6 +30,7 @@ class PruneBlockReason(str, Enum):
     IMPLICIT_CAST = "implicit_cast"              # 字面量类型与分区列不一致，隐式转换
     MISSING_PREDICATE = "missing_predicate"      # 完全没有分区谓词
     EXPRESSION_NOT_USABLE = "expression_not_usable"  # 分区列参与算术/coalesce 等
+    NON_PARTITION_FILTER = "non_partition_filter"    # OR 支不含分区列谓词，该支扫全表
     TABLE_NOT_PARTITIONED = "table_not_partitioned"
     UNPARSED = "unparsed"
     MISSING_TABLE = "missing_table"
